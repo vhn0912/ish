@@ -37,24 +37,24 @@ struct ios_pty {
     struct ios_pty_wq wqs[4];
     poll_table pt;
 
+    struct work_struct poll_cb_work;
     struct work_struct output_work;
-    struct work_struct cleanup_work;
 };
-
 
 static void ios_pty_output_work(struct work_struct *output_work) {
     struct ios_pty *pty = container_of(output_work, struct ios_pty, output_work);
-    size_t room = Terminal_roomForOutput(pty->terminal);
-    if (room == 0) {
-        printk(KERN_WARNING "ios: no room for pty output\n");
-        return;
-    }
-    char *buf = kvmalloc(room, GFP_KERNEL);
+    char *buf = kvmalloc(PAGE_SIZE, GFP_KERNEL);
     ssize_t size;
     for (;;) {
-        size = kernel_read(pty->ptm, buf, PAGE_SIZE, NULL);
+        size_t room = Terminal_roomForOutput(pty->terminal);
+        if (room == 0) {
+            printk(KERN_WARNING "ios: no room for pty output\n");
+            break;
+        }
+        size = kernel_read(pty->ptm, buf, room, NULL);
         if (size < 0) {
-            printk(KERN_WARNING "ios: pty read failed: %s\n", errname(size));
+            if (size != -EAGAIN)
+                printk(KERN_WARNING "ios: pty read failed: %s\n", errname(size));
             break;
         }
         int sent = Terminal_sendOutput_length(pty->terminal, buf, size);
@@ -66,8 +66,7 @@ static void ios_pty_output_work(struct work_struct *output_work) {
     kvfree(buf);
 }
 
-static void ios_pty_cleanup_work(struct work_struct *cleanup_work) {
-    struct ios_pty *pty = container_of(cleanup_work, struct ios_pty, cleanup_work);
+static void ios_pty_cleanup(struct ios_pty *pty) {
     for (int i = 0; i < pty->n_wqs; i++)
         remove_wait_queue(pty->wqs[i].head, &pty->wqs[i].wq);
     fput(pty->ptm);
@@ -91,23 +90,38 @@ static void ios_pty_cb_send_input(struct linux_tty *linux_tty, const char *data,
         printk(KERN_WARNING "ios: dropped %ld bytes of pty input\n", length - written);
 }
 
+static void ios_pty_cb_resize(struct linux_tty *linux_tty, int cols, int rows) {
+    struct ios_pty *pty = container_of(linux_tty, struct ios_pty, linux_tty);
+    struct winsize ws = {
+        .ws_row = rows,
+        .ws_col = cols,
+    };
+    vfs_ioctl(pty->ptm, TIOCSWINSZ, (unsigned long) &ws);
+}
+
 static void ios_pty_cb_hangup(struct linux_tty *linux_tty) {
-    
+    // TODO: figure out what this should be doing
 }
 
 static struct linux_tty_callbacks ios_pty_callbacks = {
     .can_output = ios_pty_cb_can_output,
     .send_input = ios_pty_cb_send_input,
+    .resize = ios_pty_cb_resize,
     .hangup = ios_pty_cb_hangup,
 };
 
+static void ios_pty_poll_cb_work(struct work_struct *work) {
+    struct ios_pty *pty = container_of(work, struct ios_pty, poll_cb_work);
+    __poll_t events = vfs_poll(pty->ptm, NULL);
+    if (events & EPOLLIN)
+        ios_pty_output_work(&pty->output_work);
+    if (events & EPOLLHUP)
+        ios_pty_cleanup(pty);
+}
+
 static int ptm_callback(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key) {
     struct ios_pty *pty = container_of(wq_entry, struct ios_pty_wq, wq)->pty;
-    __poll_t events = vfs_poll(pty->ptm, NULL);
-    if (events & EPOLLHUP)
-        schedule_work(&pty->cleanup_work);
-    if (events & EPOLLIN)
-        schedule_work(&pty->output_work);
+    schedule_work(&pty->poll_cb_work);
     return 0;
 }
 
@@ -129,6 +143,9 @@ struct file *ios_pty_open(nsobj_t *terminal_out) {
 
     int lock_pty = 0;
     vfs_ioctl(ptm_file, TIOCSPTLCK, (unsigned long) &lock_pty);
+    spin_lock(&ptm_file->f_lock);
+    ptm_file->f_flags |= O_NONBLOCK;
+    spin_unlock(&ptm_file->f_lock);
 
     // sadly this api can't just return a struct file *
     int fd = vfs_ioctl(ptm_file, TIOCGPTPEER, O_RDWR);
@@ -147,8 +164,8 @@ struct file *ios_pty_open(nsobj_t *terminal_out) {
     }
     pty->ptm = ptm_file;
 
+    INIT_WORK(&pty->poll_cb_work, ios_pty_poll_cb_work);
     INIT_WORK(&pty->output_work, ios_pty_output_work);
-    INIT_WORK(&pty->cleanup_work, ios_pty_cleanup_work);
 
     pty->pts_rdev = pts_file->f_inode->i_rdev;
     pty->terminal = Terminal_terminalWithType_number(MAJOR(pty->pts_rdev), MINOR(pty->pts_rdev));
